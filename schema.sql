@@ -1,0 +1,34 @@
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+  id VARCHAR(50) PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Chats / Groups table
+CREATE TABLE IF NOT EXISTS chats (
+  id VARCHAR(50) PRIMARY KEY,
+  title VARCHAR(150) NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Chat Members
+CREATE TABLE IF NOT EXISTS chat_members (
+  chat_id VARCHAR(50) REFERENCES chats(id) ON DELETE CASCADE,
+  user_id VARCHAR(50) REFERENCES users(id) ON DELETE CASCADE,
+  PRIMARY KEY (chat_id, user_id)
+);
+
+-- Messages table
+CREATE TABLE IF NOT EXISTS messages (
+  id VARCHAR(50) PRIMARY KEY,
+  chat_id VARCHAR(50) REFERENCES chats(id) ON DELETE CASCADE,
+  sender_id VARCHAR(50) REFERENCES users(id) ON DELETE SET NULL,
+  body TEXT NOT NULL,
+  type VARCHAR(20) DEFAULT 'text',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert a default demo chat room
+INSERT INTO chats (id, title) VALUES ('general', 'Friends group') 
+ON CONFLICT (id) DO NOTHING;
