@@ -9,7 +9,6 @@ const fs = require('fs');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const PORT = process.env.PORT || 3000;
-
 const FIREBASE_DB_URL =
   process.env.FIREBASE_DB_URL || 'https://whatsapp-live-4af52-default-rtdb.firebaseio.com';
 
@@ -28,20 +27,9 @@ app.use(express.json({ limit: '25mb' }));
 const DATA_FILE = path.join(__dirname, 'chat_data.json');
 let store = {
   users: {},
-  emails: {},
-  chats: {
-    general: {
-      id: 'general',
-      title: 'Friends Group',
-      isGroup: true,
-      adminId: null,
-      admins: [],
-      members: [],
-      updatedAt: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
-    },
-  },
-  messages: { general: [] },
+  contacts: {}, // { [ownerPhone]: { [contactPhone]: { phone, name, addedAt } } }
+  chats: {},
+  messages: {},
   statuses: [],
   calls: [],
   activityLogs: [],
@@ -62,13 +50,10 @@ function tryLoad(file) {
 (function loadSavedData() {
   const main = tryLoad(DATA_FILE);
   const loaded = main || tryLoad(BACKUP_FILE);
-  if (!main && fs.existsSync(DATA_FILE)) {
-    try { fs.copyFileSync(DATA_FILE, DATA_FILE + '.damaged-' + Date.now()); } catch (_e) {}
-  }
   if (loaded) {
     store = loaded;
     if (!store.users) store.users = {};
-    if (!store.emails) store.emails = {};
+    if (!store.contacts) store.contacts = {};
     if (!store.chats) store.chats = {};
     if (!store.messages) store.messages = {};
     if (!store.statuses) store.statuses = [];
@@ -85,7 +70,7 @@ function httpsRequest(options, payload) {
       res.on('end', () => resolve({ status: res.statusCode, body }));
     });
     req.on('error', (e) => resolve({ status: 0, body: String(e.message) }));
-    req.setTimeout(15000, () => { req.destroy(); });
+    req.setTimeout(15000, () => req.destroy());
     if (payload) req.write(payload);
     req.end();
   });
@@ -124,7 +109,7 @@ async function loadFromFirebaseOnStartup() {
       const remoteData = JSON.parse(res.body);
       if (remoteData && typeof remoteData === 'object') {
         store.users = { ...(remoteData.users || {}), ...store.users };
-        store.emails = { ...(remoteData.emails || {}), ...store.emails };
+        store.contacts = { ...(remoteData.contacts || {}), ...store.contacts };
         store.chats = { ...(remoteData.chats || {}), ...store.chats };
         store.messages = { ...(remoteData.messages || {}), ...store.messages };
         if (Array.isArray(remoteData.statuses) && store.statuses.length === 0) store.statuses = remoteData.statuses;
@@ -154,28 +139,6 @@ function saveStore() {
   saveTimer = setTimeout(() => { saveTimer = null; writeStoreNow(); }, 300);
 }
 
-function logUserActivity({ phone, name, platform, action, details }) {
-  if (!store.activityLogs) store.activityLogs = [];
-  const entry = {
-    id: 'act_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-    phone: normalizePhone(phone) || 'unknown',
-    name: name || phone || 'User',
-    platform: platform || 'unknown',
-    action,
-    details: details || '',
-    timestamp: new Date().toISOString(),
-  };
-  store.activityLogs.push(entry);
-  if (store.activityLogs.length > 500) {
-    store.activityLogs = store.activityLogs.slice(-500);
-  }
-  saveStore();
-  if (typeof io !== 'undefined' && io) {
-    io.emit('activity:new', entry);
-  }
-  return entry;
-}
-
 process.on('SIGINT', () => { writeStoreNow(); process.exit(0); });
 process.on('SIGTERM', () => { writeStoreNow(); process.exit(0); });
 
@@ -188,8 +151,18 @@ function makeDirectChatId(phoneA, phoneB) {
   return `dm_${sorted[0]}_${sorted[1]}`;
 }
 
-const activeSocketByPhone = new Map();
+function getUserContactsMap(phone) {
+  const clean = normalizePhone(phone);
+  if (!store.contacts[clean]) store.contacts[clean] = {};
+  return store.contacts[clean];
+}
 
+function emitToMembers(members, event, payload) {
+  if (!Array.isArray(members)) return;
+  members.forEach((m) => io.to('user:' + normalizePhone(m)).emit(event, payload));
+}
+
+const activeSocketByPhone = new Map();
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
@@ -203,7 +176,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage, limits: { fileSize: 25 * 1024 * 1024 } });
 app.use('/uploads', express.static(uploadDir));
 
-const SERVER_VERSION = 'v13-files-reactions-webrtc-fix';
+const SERVER_VERSION = 'v14-isolated-contacts-avatars';
 app.get('/health', (_req, res) => res.json({ ok: true, version: SERVER_VERSION, firebaseDb: FIREBASE_DB_URL }));
 
 app.post('/upload', upload.single('media'), (req, res) => {
@@ -241,6 +214,7 @@ app.post('/upload-base64', (req, res) => {
   });
 });
 
+// WebRTC Call Page
 app.get('/rtc-call', (req, res) => {
   const { room, userId, callType } = req.query;
   const turnUrl = process.env.TURN_URL || '';
@@ -288,73 +262,33 @@ app.get('/rtc-call', (req, res) => {
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' }
     ];
-    if (TURN_URL) {
-      iceServers.push({
-        urls: TURN_URL,
-        username: TURN_USERNAME || undefined,
-        credential: TURN_CREDENTIAL || undefined
-      });
-    }
+    if (TURN_URL) iceServers.push({ urls: TURN_URL, username: TURN_USERNAME || undefined, credential: TURN_CREDENTIAL || undefined });
 
     const socket = io({ transports: ['websocket', 'polling'] });
-    let pc = null;
-    let localStream = null;
-    let pendingCandidates = [];
-    let makingOffer = false;
+    let pc = null, localStream = null, pendingCandidates = [], makingOffer = false;
 
-    function setStatus(msg) {
-      statusEl.style.display = 'block';
-      statusEl.innerText = msg;
-    }
+    function setStatus(msg) { statusEl.style.display = 'block'; statusEl.innerText = msg; }
 
     function createPeer() {
       if (pc) return pc;
       pc = new RTCPeerConnection({ iceServers });
-
-      if (localStream) {
-        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-      }
-
+      if (localStream) localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
       pc.ontrack = (event) => {
         const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-        remoteAudio.srcObject = stream;
-        remoteAudio.muted = false;
-        remoteAudio.volume = 1.0;
-        remoteAudio.play().catch(() => {});
-
+        remoteAudio.srcObject = stream; remoteAudio.muted = false; remoteAudio.volume = 1.0; remoteAudio.play().catch(() => {});
         if (CALL_TYPE === 'video') {
-          remoteVideo.srcObject = stream;
-          remoteVideo.muted = false;
-          remoteVideo.play().catch(() => {});
+          remoteVideo.srcObject = stream; remoteVideo.muted = false; remoteVideo.play().catch(() => {});
           setStatus('Live Video Connected');
           setTimeout(() => { statusEl.style.display = 'none'; }, 1500);
-        } else {
-          setStatus('Voice Connected');
-        }
+        } else { setStatus('Voice Connected'); }
       };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit('rtc:signal', { room: ROOM, sender: USER_ID, type: 'candidate', candidate: event.candidate });
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        if (!pc) return;
-        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-          setStatus(CALL_TYPE === 'video' ? 'Live Video Connected' : 'Voice Connected');
-        } else if (pc.iceConnectionState === 'failed') {
-          setStatus('ICE failed — TURN server required for restricted networks');
-        }
-      };
-
+      pc.onicecandidate = (e) => { if (e.candidate) socket.emit('rtc:signal', { room: ROOM, sender: USER_ID, type: 'candidate', candidate: e.candidate }); };
       return pc;
     }
 
     async function flushCandidates(peer) {
       while (pendingCandidates.length > 0) {
-        const cand = pendingCandidates.shift();
-        try { await peer.addIceCandidate(new RTCIceCandidate(cand)); } catch (_e) {}
+        try { await peer.addIceCandidate(new RTCIceCandidate(pendingCandidates.shift())); } catch (_e) {}
       }
     }
 
@@ -363,47 +297,27 @@ app.get('/rtc-call', (req, res) => {
       if (makingOffer || peer.signalingState !== 'stable') return;
       try {
         makingOffer = true;
-        const offer = await peer.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: CALL_TYPE === 'video'
-        });
+        const offer = await peer.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: CALL_TYPE === 'video' });
         await peer.setLocalDescription(offer);
         socket.emit('rtc:signal', { room: ROOM, sender: USER_ID, type: 'offer', sdp: peer.localDescription });
-      } catch (_e) {
-      } finally {
-        makingOffer = false;
-      }
+      } catch (_e) {} finally { makingOffer = false; }
     }
 
-    socket.on('connect', () => {
-      socket.emit('rtc:join', { room: ROOM, userId: USER_ID });
-    });
+    socket.on('connect', () => socket.emit('rtc:join', { room: ROOM, userId: USER_ID }));
 
     navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: CALL_TYPE === 'video' ? { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } } : false
     }).then(stream => {
       localStream = stream;
-      if (CALL_TYPE === 'video') {
-        localVideo.srcObject = stream;
-        localVideo.play().catch(() => {});
-      }
-      if (pc && localStream) {
-        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-      } else {
-        createPeer();
-      }
+      if (CALL_TYPE === 'video') { localVideo.srcObject = stream; localVideo.play().catch(() => {}); }
+      if (pc && localStream) localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      else createPeer();
       socket.emit('rtc:join', { room: ROOM, userId: USER_ID });
       setStatus('Joined call room, waiting for peer...');
-    }).catch(err => {
-      setStatus('Mic/Cam blocked: ' + (err.message || err.name));
-    });
+    }).catch(err => setStatus('Mic/Cam blocked: ' + (err.message || err.name)));
 
-    socket.on('rtc:peer-joined', async ({ userId }) => {
-      if (!userId || userId === USER_ID) return;
-      setStatus('Peer joined, starting call...');
-      await sendOffer();
-    });
+    socket.on('rtc:peer-joined', async ({ userId }) => { if (userId && userId !== USER_ID) { setStatus('Peer joined, starting call...'); await sendOffer(); } });
 
     socket.on('rtc:signal', async (data) => {
       if (!data || data.sender === USER_ID) return;
@@ -420,11 +334,8 @@ app.get('/rtc-call', (req, res) => {
           await peer.setRemoteDescription(new RTCSessionDescription(data.sdp));
           await flushCandidates(peer);
         } else if (data.type === 'candidate' && data.candidate) {
-          if (peer.remoteDescription && peer.remoteDescription.type) {
-            await peer.addIceCandidate(new RTCIceCandidate(data.candidate));
-          } else {
-            pendingCandidates.push(data.candidate);
-          }
+          if (peer.remoteDescription && peer.remoteDescription.type) await peer.addIceCandidate(new RTCIceCandidate(data.candidate));
+          else pendingCandidates.push(data.candidate);
         }
       } catch (_e) {}
     });
@@ -432,12 +343,8 @@ app.get('/rtc-call', (req, res) => {
     window.addEventListener('message', (event) => {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.action === 'toggleMute' && localStream) {
-          localStream.getAudioTracks().forEach(t => { t.enabled = !msg.muted; });
-        }
-        if (msg.action === 'toggleCam' && localStream) {
-          localStream.getVideoTracks().forEach(t => { t.enabled = msg.cameraOn; });
-        }
+        if (msg.action === 'toggleMute' && localStream) localStream.getAudioTracks().forEach(t => { t.enabled = !msg.muted; });
+        if (msg.action === 'toggleCam' && localStream) localStream.getVideoTracks().forEach(t => { t.enabled = msg.cameraOn; });
       } catch (_e) {}
     });
   </script>
@@ -445,6 +352,7 @@ app.get('/rtc-call', (req, res) => {
 </html>`);
 });
 
+// Auth: Fresh on first login, preserves all data on returning login
 app.post('/auth/direct-login', (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   const name = String(req.body?.name || '').trim();
@@ -463,8 +371,9 @@ app.post('/auth/direct-login', (req, res) => {
   const userObj = {
     id: phone,
     phone,
-    name,
+    name: existingUser.name || name,
     about: existingUser.about || 'Hey there! I am using WhatsApp Live.',
+    avatar: existingUser.avatar || null,
     platform,
     online: true,
     activeSessionId: sessionId,
@@ -472,33 +381,67 @@ app.post('/auth/direct-login', (req, res) => {
   };
 
   store.users[phone] = userObj;
-  if (store.chats.general && Array.isArray(store.chats.general.members) && !store.chats.general.members.includes(phone)) {
-    store.chats.general.members.push(phone);
-  }
+  if (!store.contacts[phone]) store.contacts[phone] = {};
+  saveStore();
 
-  logUserActivity({ phone, name: userObj.name, platform, action: 'DIRECT_LOGIN', details: `Logged in on ${platform.toUpperCase()}` });
   const token = jwt.sign({ sub: phone, phone, name: userObj.name, sessionId, platform }, JWT_SECRET, { expiresIn: '30d' });
   res.json({ token, user: userObj, sessionId });
 });
 
+// Update User Profile (Name, About, Avatar)
 app.put('/users/:phone/profile', (req, res) => {
   const phone = normalizePhone(req.params.phone);
-  const { name, about } = req.body || {};
+  const { name, about, avatar } = req.body || {};
   if (!store.users[phone]) return res.status(404).json({ error: 'User not found' });
   if (typeof name === 'string' && name.trim()) store.users[phone].name = name.trim();
   if (typeof about === 'string') store.users[phone].about = about.trim() || 'Hey there! I am using WhatsApp Live.';
-  logUserActivity({ phone, name: store.users[phone].name, platform: store.users[phone].platform || 'app', action: 'PROFILE_UPDATED', details: 'Updated profile' });
+  if (avatar !== undefined) store.users[phone].avatar = avatar || null;
+  saveStore();
   io.emit('presence', { userId: phone, online: store.users[phone].online, user: store.users[phone] });
   res.json({ success: true, user: store.users[phone] });
 });
 
-app.get('/users', (_req, res) => res.json(Object.values(store.users)));
-
-app.get('/activity', (req, res) => {
+// Contacts-Only Endpoints
+app.get('/contacts', (req, res) => {
   const userId = normalizePhone(req.query.userId);
-  const logs = store.activityLogs || [];
-  if (!userId) return res.json(logs.slice(-100).reverse());
-  res.json(logs.filter((l) => l.phone === userId).slice(-100).reverse());
+  if (!userId) return res.json([]);
+  const map = getUserContactsMap(userId);
+  const list = Object.values(map).map((c) => {
+    const u = store.users[c.phone];
+    return {
+      phone: c.phone,
+      name: c.name || u?.name || c.phone,
+      about: u?.about || 'Hey there! I am using WhatsApp Live.',
+      avatar: u?.avatar || null,
+      online: !!u?.online,
+      lastSeen: u?.lastSeen || null,
+      registered: !!u,
+    };
+  });
+  res.json(list);
+});
+
+app.post('/contacts', (req, res) => {
+  const userId = normalizePhone(req.body?.userId);
+  const contactPhone = normalizePhone(req.body?.contactPhone);
+  const contactName = String(req.body?.contactName || contactPhone).trim();
+  if (!userId || !contactPhone || contactPhone.length < 4) return res.status(400).json({ error: 'Valid phone number required' });
+  if (userId === contactPhone) return res.status(400).json({ error: 'You cannot add yourself as a contact.' });
+
+  const map = getUserContactsMap(userId);
+  map[contactPhone] = { phone: contactPhone, name: contactName || contactPhone, addedAt: new Date().toISOString() };
+  saveStore();
+  res.json({ success: true, contact: map[contactPhone] });
+});
+
+app.delete('/contacts/:contactPhone', (req, res) => {
+  const userId = normalizePhone(req.query.userId);
+  const contactPhone = normalizePhone(req.params.contactPhone);
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const map = getUserContactsMap(userId);
+  delete map[contactPhone];
+  saveStore();
+  res.json({ success: true });
 });
 
 function visibleMessages(chatId, uid) {
@@ -513,33 +456,45 @@ function visibleMessages(chatId, uid) {
     .map((m) => (m.deletedForEveryone ? { ...m, type: 'text', body: 'This message was deleted' } : m));
 }
 
+// Strict User-Isolated Chats
 app.get('/chats', (req, res) => {
   const userId = normalizePhone(req.query.userId);
+  if (!userId) return res.json([]);
+  const myContacts = getUserContactsMap(userId);
+
   const visibleChats = Object.values(store.chats)
     .filter((c) => {
-      if (userId && c.clearedAt && c.clearedAt[userId] && visibleMessages(c.id, userId).length === 0) return false;
-      if (c.isGroup) {
-        if (c.id === 'general' || !userId) return true;
-        return !Array.isArray(c.members) || c.members.length === 0 || c.members.includes(userId);
-      }
-      if (!userId) return true;
-      return Array.isArray(c.members) && c.members.includes(userId);
+      if (!Array.isArray(c.members) || !c.members.includes(userId)) return false;
+      if (c.clearedAt && c.clearedAt[userId] && visibleMessages(c.id, userId).length === 0) return false;
+      return true;
     })
     .map((c) => {
       const msgs = visibleMessages(c.id, userId);
       const lastMsg = msgs[msgs.length - 1];
       let displayTitle = c.title;
+      let avatar = c.avatar || null;
       let otherUser = null;
-      if (!c.isGroup && userId && Array.isArray(c.members)) {
-        const otherPhone = c.members.find((m) => m !== userId) || userId;
+      let otherPhone = null;
+      let isContact = true;
+
+      if (!c.isGroup && Array.isArray(c.members)) {
+        otherPhone = c.members.find((m) => m !== userId) || userId;
         otherUser = store.users[otherPhone] || null;
-        displayTitle = otherUser ? `${otherUser.name} (${otherPhone})` : c.memberNames?.[otherPhone] || otherPhone;
+        const savedContact = myContacts[otherPhone];
+        isContact = !!savedContact;
+        displayTitle = savedContact ? savedContact.name : otherUser ? `${otherUser.name} (${otherPhone})` : otherPhone;
+        avatar = otherUser?.avatar || null;
       }
+
       return {
         ...c,
         title: displayTitle,
+        avatar,
+        otherPhone,
+        isContact,
         otherOnline: otherUser ? !!otherUser.online : false,
         otherLastSeen: otherUser ? otherUser.lastSeen : null,
+        otherAbout: otherUser ? otherUser.about : null,
         updatedAt: lastMsg ? lastMsg.createdAt : c.updatedAt || c.createdAt,
         lastMessage: lastMsg
           ? lastMsg.deletedForEveryone
@@ -554,33 +509,56 @@ app.get('/chats', (req, res) => {
       };
     })
     .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+
   res.json(visibleChats);
 });
 
+// Create Custom Group (Name, Description, Avatar, Members)
 app.post('/chats', (req, res) => {
-  const { id, title, creatorPhone, members } = req.body || {};
-  if (!title) return res.status(400).json({ error: 'Group title required' });
-  const chatId = id || 'group_' + Date.now().toString(36);
-  const now = new Date().toISOString();
+  const { title, description, avatar, creatorPhone, members } = req.body || {};
+  if (!title || !title.trim()) return res.status(400).json({ error: 'Group name is required' });
   const cleanCreator = normalizePhone(creatorPhone);
-  const creatorUser = store.users[cleanCreator];
+  if (!cleanCreator) return res.status(400).json({ error: 'Creator phone required' });
+
+  const chatId = 'group_' + Date.now().toString(36);
+  const now = new Date().toISOString();
   const initialMembers = Array.from(new Set([cleanCreator, ...(Array.isArray(members) ? members.map(normalizePhone) : [])].filter(Boolean)));
+
   const chatObj = {
     id: chatId,
     title: title.trim(),
+    description: String(description || '').trim(),
+    avatar: avatar || null,
     isGroup: true,
-    adminId: cleanCreator || null,
-    admins: cleanCreator ? [cleanCreator] : [],
+    adminId: cleanCreator,
+    admins: [cleanCreator],
     members: initialMembers,
-    memberNames: cleanCreator ? { [cleanCreator]: creatorUser?.name || 'Admin' } : {},
     updatedAt: now,
     createdAt: now,
   };
+
   store.chats[chatId] = chatObj;
-  if (!store.messages[chatId]) store.messages[chatId] = [];
-  logUserActivity({ phone: cleanCreator, name: creatorUser?.name || cleanCreator, platform: creatorUser?.platform || 'app', action: 'GROUP_CREATED', details: `Created group "${chatObj.title}"` });
-  io.emit('chat:created', chatObj);
+  store.messages[chatId] = [];
+  saveStore();
+  emitToMembers(initialMembers, 'chat:created', chatObj);
   res.json({ success: true, chat: chatObj });
+});
+
+// Edit Group Profile (Name, Description, Avatar)
+app.put('/chats/:chatId/profile', (req, res) => {
+  const chat = store.chats[req.params.chatId];
+  if (!chat || !chat.isGroup) return res.status(404).json({ error: 'Group not found' });
+  const requesterPhone = normalizePhone(req.body?.requesterPhone);
+  const admins = Array.isArray(chat.admins) && chat.admins.length > 0 ? chat.admins : [chat.adminId];
+  if (!admins.includes(requesterPhone)) return res.status(403).json({ error: 'Only group admins can edit group info.' });
+
+  if (typeof req.body?.title === 'string' && req.body.title.trim()) chat.title = req.body.title.trim();
+  if (typeof req.body?.description === 'string') chat.description = req.body.description.trim();
+  if (req.body?.avatar !== undefined) chat.avatar = req.body.avatar || null;
+  chat.updatedAt = new Date().toISOString();
+  saveStore();
+  emitToMembers(chat.members, 'chat:updated', { chatId: chat.id });
+  res.json({ success: true, chat });
 });
 
 app.get('/chats/:chatId/details', (req, res) => {
@@ -591,8 +569,9 @@ app.get('/chats/:chatId/details', (req, res) => {
     const u = store.users[p];
     return {
       phone: p,
-      name: u?.name || chat.memberNames?.[p] || p,
+      name: u?.name || p,
       about: u?.about || 'Hey there! I am using WhatsApp Live.',
+      avatar: u?.avatar || null,
       online: !!u?.online,
       isAdmin: admins.includes(p),
     };
@@ -605,20 +584,15 @@ app.post('/chats/:chatId/members', (req, res) => {
   if (!chat || !chat.isGroup) return res.status(404).json({ error: 'Group not found' });
   const requesterPhone = normalizePhone(req.body?.requesterPhone);
   const memberPhone = normalizePhone(req.body?.memberPhone);
-  const memberName = String(req.body?.memberName || memberPhone).trim();
   if (!memberPhone || memberPhone.length < 4) return res.status(400).json({ error: 'Valid phone number required' });
-  const admins = Array.isArray(chat.admins) && chat.admins.length > 0 ? chat.admins : chat.adminId ? [chat.adminId] : [];
-  if (admins.length > 0 && !admins.includes(requesterPhone)) return res.status(403).json({ error: 'Only group admins can add members.' });
-  if (!store.users[memberPhone]) {
-    store.users[memberPhone] = { id: memberPhone, phone: memberPhone, name: memberName || memberPhone, about: 'Hey there! I am using WhatsApp Live.', online: false, lastSeen: null };
-  }
+  const admins = Array.isArray(chat.admins) && chat.admins.length > 0 ? chat.admins : [chat.adminId];
+  if (!admins.includes(requesterPhone)) return res.status(403).json({ error: 'Only group admins can add members.' });
+
   if (!Array.isArray(chat.members)) chat.members = [];
   if (!chat.members.includes(memberPhone)) chat.members.push(memberPhone);
-  if (!chat.memberNames) chat.memberNames = {};
-  chat.memberNames[memberPhone] = store.users[memberPhone].name;
   chat.updatedAt = new Date().toISOString();
   saveStore();
-  io.emit('chat:updated', { chatId: chat.id });
+  emitToMembers(chat.members, 'chat:updated', { chatId: chat.id });
   res.json({ success: true, chat });
 });
 
@@ -628,7 +602,7 @@ app.post('/chats/:chatId/admins', (req, res) => {
   const requesterPhone = normalizePhone(req.body?.requesterPhone);
   const targetPhone = normalizePhone(req.body?.targetPhone);
   const makeAdmin = req.body?.makeAdmin !== false;
-  const admins = Array.isArray(chat.admins) && chat.admins.length > 0 ? [...chat.admins] : chat.adminId ? [chat.adminId] : [];
+  const admins = Array.isArray(chat.admins) && chat.admins.length > 0 ? [...chat.admins] : [chat.adminId];
   if (!admins.includes(requesterPhone)) return res.status(403).json({ error: 'Only group admins can manage admin roles.' });
   if (makeAdmin) {
     if (!admins.includes(targetPhone)) admins.push(targetPhone);
@@ -640,7 +614,7 @@ app.post('/chats/:chatId/admins', (req, res) => {
   chat.admins = admins;
   chat.adminId = admins[0] || null;
   saveStore();
-  io.emit('chat:updated', { chatId: chat.id });
+  emitToMembers(chat.members, 'chat:updated', { chatId: chat.id });
   res.json({ success: true, chat });
 });
 
@@ -649,8 +623,8 @@ app.delete('/chats/:chatId/members/:memberPhone', (req, res) => {
   if (!chat || !chat.isGroup) return res.status(404).json({ error: 'Group not found' });
   const requesterPhone = normalizePhone(req.query.requesterPhone || req.body?.requesterPhone);
   const targetPhone = normalizePhone(req.params.memberPhone);
-  const admins = Array.isArray(chat.admins) && chat.admins.length > 0 ? [...chat.admins] : chat.adminId ? [chat.adminId] : [];
-  if (requesterPhone !== targetPhone && admins.length > 0 && !admins.includes(requesterPhone)) {
+  const admins = Array.isArray(chat.admins) && chat.admins.length > 0 ? [...chat.admins] : [chat.adminId];
+  if (requesterPhone !== targetPhone && !admins.includes(requesterPhone)) {
     return res.status(403).json({ error: 'Only group admins can remove members.' });
   }
   chat.members = (chat.members || []).filter((p) => p !== targetPhone);
@@ -659,49 +633,76 @@ app.delete('/chats/:chatId/members/:memberPhone', (req, res) => {
   chat.adminId = chat.admins[0] || null;
   saveStore();
   io.to('user:' + targetPhone).emit('chat:deleted', { chatId: chat.id });
-  io.emit('chat:updated', { chatId: chat.id });
+  emitToMembers(chat.members, 'chat:updated', { chatId: chat.id });
   res.json({ success: true, chat });
 });
 
+// Direct Chat: Enforces Contacts-Only
 app.post('/chats/direct', (req, res) => {
   const myPhone = normalizePhone(req.body?.myPhone);
   const friendPhone = normalizePhone(req.body?.friendPhone);
-  const friendName = String(req.body?.friendName || friendPhone).trim();
   if (!myPhone || !friendPhone) return res.status(400).json({ error: 'Both phones required' });
-  if (!store.users[friendPhone]) {
-    store.users[friendPhone] = { id: friendPhone, phone: friendPhone, name: friendName || friendPhone, about: 'Hey there! I am using WhatsApp Live.', online: false, lastSeen: null };
+
+  const myContacts = getUserContactsMap(myPhone);
+  if (!myContacts[friendPhone]) {
+    return res.status(403).json({ error: 'Add this person to your Contacts first before starting a chat.' });
   }
+
   const chatId = makeDirectChatId(myPhone, friendPhone);
   const now = new Date().toISOString();
   if (!store.chats[chatId]) {
-    store.chats[chatId] = { id: chatId, title: `${store.users[friendPhone].name} (${friendPhone})`, isGroup: false, members: [myPhone, friendPhone], updatedAt: now, createdAt: now };
+    store.chats[chatId] = {
+      id: chatId,
+      title: myContacts[friendPhone].name,
+      isGroup: false,
+      members: [myPhone, friendPhone],
+      updatedAt: now,
+      createdAt: now,
+    };
   }
   if (!store.messages[chatId]) store.messages[chatId] = [];
   saveStore();
-  io.to('user:' + friendPhone).emit('chat:created', store.chats[chatId]);
-  io.to('user:' + myPhone).emit('chat:created', store.chats[chatId]);
-  res.json({ success: true, chat: { ...store.chats[chatId], otherPhone: friendPhone } });
+
+  const otherUser = store.users[friendPhone] || null;
+  emitToMembers([myPhone, friendPhone], 'chat:created', store.chats[chatId]);
+  res.json({
+    success: true,
+    chat: {
+      ...store.chats[chatId],
+      title: myContacts[friendPhone].name,
+      avatar: otherUser?.avatar || null,
+      otherPhone: friendPhone,
+      otherOnline: !!otherUser?.online,
+      otherLastSeen: otherUser?.lastSeen || null,
+      otherAbout: otherUser?.about || null,
+      isContact: true,
+    },
+  });
 });
 
 app.delete('/chats/:chatId', (req, res) => {
   const chatId = req.params.chatId;
-  const userId = normalizePhone(req.query.userId || (req.body && req.body.userId));
+  const userId = normalizePhone(req.query.userId || req.body?.userId);
   if (!userId) return res.status(400).json({ error: 'userId required' });
   const chat = store.chats[chatId];
   if (!chat) return res.status(404).json({ error: 'Chat not found' });
   if (!chat.clearedAt) chat.clearedAt = {};
   chat.clearedAt[userId] = new Date().toISOString();
-  logUserActivity({ phone: userId, name: store.users[userId]?.name || userId, platform: store.users[userId]?.platform || 'app', action: 'CHAT_CLEARED', details: `Cleared chat ${chat.title || chatId}` });
+  saveStore();
   io.to('user:' + userId).emit('chat:deleted', { chatId });
   res.json({ success: true });
 });
 
-app.get('/statuses', (_req, res) => {
+// Statuses: Only Self + Saved Contacts
+app.get('/statuses', (req, res) => {
+  const userId = normalizePhone(req.query.userId);
   const now = Date.now();
-  if (!store.statuses) store.statuses = [];
-  store.statuses = store.statuses.filter((s) => now - new Date(s.createdAt).getTime() < 86400000);
+  store.statuses = (store.statuses || []).filter((s) => now - new Date(s.createdAt).getTime() < 86400000);
   saveStore();
-  res.json(store.statuses);
+  if (!userId) return res.json([]);
+  const myContacts = getUserContactsMap(userId);
+  const visible = store.statuses.filter((s) => s.phone === userId || !!myContacts[s.phone]);
+  res.json(visible);
 });
 
 app.post('/statuses', (req, res) => {
@@ -716,27 +717,30 @@ app.post('/statuses', (req, res) => {
     content,
     createdAt: new Date().toISOString(),
   };
-  if (!store.statuses) store.statuses = [];
   store.statuses.push(statusObj);
-  logUserActivity({ phone: cleanPhone, name: statusObj.name, platform: store.users[cleanPhone]?.platform || 'app', action: 'STATUS_POSTED', details: statusObj.type === 'image' ? 'Posted a photo story' : `Posted story: "${statusObj.content.slice(0, 40)}"` });
-  io.emit('status:new', statusObj);
+  saveStore();
+
+  // Notify self + anyone who has this user in their contacts
+  io.to('user:' + cleanPhone).emit('status:new', statusObj);
+  Object.keys(store.contacts).forEach((owner) => {
+    if (store.contacts[owner] && store.contacts[owner][cleanPhone]) {
+      io.to('user:' + owner).emit('status:new', statusObj);
+    }
+  });
   res.json({ success: true, status: statusObj });
 });
 
 app.delete('/statuses/:statusId', (req, res) => {
   const statusId = req.params.statusId;
-  if (store.statuses) {
-    store.statuses = store.statuses.filter((s) => s.id !== statusId);
-    saveStore();
-    io.emit('status:deleted', { statusId });
-    return res.json({ success: true });
-  }
-  res.status(404).json({ error: 'Status not found' });
+  store.statuses = (store.statuses || []).filter((s) => s.id !== statusId);
+  saveStore();
+  io.emit('status:deleted', { statusId });
+  res.json({ success: true });
 });
 
 app.get('/calls', (req, res) => {
   const userId = normalizePhone(req.query.userId);
-  if (!userId) return res.json(store.calls.slice(-50).reverse());
+  if (!userId) return res.json([]);
   res.json(store.calls.filter((c) => c.callerId === userId || c.targetId === userId).slice(-50).reverse());
 });
 
@@ -748,9 +752,7 @@ io.on('connection', (socket) => {
     socket.join('rtc:' + room);
     socket.to('rtc:' + room).emit('rtc:peer-joined', { userId });
   });
-  socket.on('rtc:signal', (data) => {
-    socket.to('rtc:' + data.room).emit('rtc:signal', data);
-  });
+  socket.on('rtc:signal', (data) => socket.to('rtc:' + data.room).emit('rtc:signal', data));
 
   const token = socket.handshake.auth && socket.handshake.auth.token;
   if (!token) return;
@@ -782,16 +784,14 @@ io.on('connection', (socket) => {
   io.emit('presence', { userId: uid, online: true });
 
   socket.on('chat:join', (chatId) => {
+    const chat = store.chats[chatId];
+    if (chat && Array.isArray(chat.members) && !chat.members.includes(uid)) return;
     socket.join('chat:' + chatId);
     let changed = false;
     (store.messages[chatId] || []).forEach((m) => {
       if (m.senderId !== uid) {
         if (!Array.isArray(m.readBy)) m.readBy = [];
-        if (!m.readBy.includes(uid)) {
-          m.readBy.push(uid);
-          m.status = 'read';
-          changed = true;
-        }
+        if (!m.readBy.includes(uid)) { m.readBy.push(uid); m.status = 'read'; changed = true; }
       }
     });
     if (changed) {
@@ -806,11 +806,7 @@ io.on('connection', (socket) => {
     (store.messages[chatId] || []).forEach((m) => {
       if (m.senderId !== uid) {
         if (!Array.isArray(m.readBy)) m.readBy = [];
-        if (!m.readBy.includes(uid)) {
-          m.readBy.push(uid);
-          m.status = 'read';
-          changed = true;
-        }
+        if (!m.readBy.includes(uid)) { m.readBy.push(uid); m.status = 'read'; changed = true; }
       }
     });
     if (changed) {
@@ -833,6 +829,7 @@ io.on('connection', (socket) => {
     const reply = (r) => { if (typeof ack === 'function') ack(r); };
     const msg = (store.messages[chatId] || []).find((m) => m.id === messageId);
     if (!msg) return reply({ error: 'Message not found' });
+    const room = store.chats[chatId];
     if (scope === 'everyone') {
       if (msg.senderId !== uid) return reply({ error: 'You can delete for everyone only your own messages.' });
       if (Date.now() - new Date(msg.createdAt).getTime() > 5 * 60 * 1000) {
@@ -840,9 +837,9 @@ io.on('connection', (socket) => {
       }
       msg.deletedForEveryone = true;
       msg.deletedAt = new Date().toISOString();
-      logUserActivity({ phone: uid, name: store.users[uid]?.name || payload.name, platform: payload.platform || 'app', action: 'MESSAGE_DELETED_EVERYONE', details: `Deleted message ${messageId} in ${chatId}` });
+      saveStore();
       io.to('chat:' + chatId).emit('message:deleted', { chatId, messageId, scope: 'everyone' });
-      io.emit('chat:updated', { chatId });
+      if (room) emitToMembers(room.members, 'chat:updated', { chatId });
       return reply({ success: true });
     }
     if (!Array.isArray(msg.deletedFor)) msg.deletedFor = [];
@@ -864,13 +861,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('message:send', (msg, ack) => {
+    const room = store.chats[msg.chatId];
+    if (!room || !Array.isArray(room.members) || !room.members.includes(uid)) {
+      if (typeof ack === 'function') ack({ error: 'Not a member of this chat' });
+      return;
+    }
+
     const messageId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const createdAt = new Date().toISOString();
-    if (!store.chats[msg.chatId] && msg.chatId.startsWith('dm_')) {
-      const parts = msg.chatId.replace('dm_', '').split('_');
-      store.chats[msg.chatId] = { id: msg.chatId, title: msg.chatId, isGroup: false, members: parts, updatedAt: createdAt, createdAt };
-    }
-    if (store.chats[msg.chatId]) store.chats[msg.chatId].updatedAt = createdAt;
+    room.updatedAt = createdAt;
+
     const senderName = store.users[uid]?.name || payload.name;
     const saved = {
       id: messageId,
@@ -889,27 +889,23 @@ io.on('connection', (socket) => {
     };
     if (!store.messages[msg.chatId]) store.messages[msg.chatId] = [];
     store.messages[msg.chatId].push(saved);
-    logUserActivity({
-      phone: uid,
-      name: senderName,
-      platform: payload.platform || 'app',
-      action: 'MESSAGE_SENT',
-      details: saved.type === 'image' ? `Sent image in ${msg.chatId}` : saved.type === 'file' ? `Sent file ${saved.fileName || ''} in ${msg.chatId}` : `Sent message in ${msg.chatId}: "${String(saved.body).slice(0, 35)}"`,
-    });
+    saveStore();
+
     socket.to('chat:' + msg.chatId).emit('message:new', saved);
-    io.emit('chat:updated', { chatId: msg.chatId });
-    const room = store.chats[msg.chatId];
-    if (room) {
-      if (room.isGroup) {
-        socket.broadcast.emit('notification:message', { chatId: msg.chatId, chatTitle: room.title, isGroup: true, message: saved });
-      } else if (Array.isArray(room.members)) {
-        room.members.forEach((memberPhone) => {
-          if (memberPhone !== uid) {
-            io.to('user:' + memberPhone).emit('notification:message', { chatId: msg.chatId, chatTitle: `${senderName} (${uid})`, isGroup: false, otherPhone: uid, message: saved });
-          }
+    emitToMembers(room.members, 'chat:updated', { chatId: msg.chatId });
+
+    room.members.forEach((memberPhone) => {
+      if (memberPhone !== uid) {
+        io.to('user:' + memberPhone).emit('notification:message', {
+          chatId: msg.chatId,
+          chatTitle: room.isGroup ? room.title : `${senderName} (${uid})`,
+          isGroup: room.isGroup,
+          otherPhone: room.isGroup ? null : uid,
+          message: saved,
         });
       }
-    }
+    });
+
     if (typeof ack === 'function') ack({ status: 'delivered', id: saved.id, createdAt: saved.createdAt });
   });
 
@@ -927,7 +923,7 @@ io.on('connection', (socket) => {
       createdAt: new Date().toISOString(),
     };
     store.calls.push(callRecord);
-    logUserActivity({ phone: uid, name: callerName, platform: payload.platform || 'app', action: 'CALL_STARTED', details: `Started ${callRecord.callType} call with ${callRecord.targetName}` });
+    saveStore();
     if (callPayload.targetId && callPayload.targetId !== uid) {
       io.to('user:' + callPayload.targetId).emit('call:incoming', callRecord);
     } else {
@@ -954,8 +950,8 @@ io.on('connection', (socket) => {
       if (store.users[uid]) {
         store.users[uid].online = false;
         store.users[uid].lastSeen = lastSeen;
+        saveStore();
       }
-      logUserActivity({ phone: uid, name: store.users[uid]?.name || payload.name, platform: payload.platform || 'app', action: 'USER_OFFLINE', details: 'Disconnected from app' });
       io.emit('presence', { userId: uid, online: false, lastSeen });
     }
   });
