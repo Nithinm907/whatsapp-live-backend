@@ -6,13 +6,35 @@ const nodemailer = require('nodemailer');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'whatsapp-live-secret-key-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || 'local-testing-secret';
+if (!process.env.JWT_SECRET && (process.env.RENDER || process.env.NODE_ENV === 'production')) {
+  console.error('STOP: set a long random JWT_SECRET environment variable on Render (at least 32 random characters).');
+  process.exit(1);
+}
+if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
+  console.error('STOP: JWT_SECRET is too short. Use at least 32 random characters.');
+  process.exit(1);
+}
+const crypto = require('crypto');
+const FIREBASE_DB_SECRET = process.env.FIREBASE_DB_SECRET || '';
 const FIREBASE_DB_URL =
   process.env.FIREBASE_DB_URL ||
   'https://whatsapp-live-4af52-default-rtdb.firebaseio.com/whatsapp_live_store.json';
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(cors());
+
+// Simple rate limiter: allows `limit` hits per `windowMs` for a key
+const rateBuckets = new Map();
+function allowHit(key, limit, windowMs) {
+  const now = Date.now();
+  const list = (rateBuckets.get(key) || []).filter((t) => now - t < windowMs);
+  if (list.length >= limit) { rateBuckets.set(key, list); return false; }
+  list.push(now);
+  rateBuckets.set(key, list);
+  return true;
+}
 app.use(express.json({ limit: '10mb' }));
 
 const server = http.createServer(app);
@@ -35,16 +57,25 @@ const activeSocketByPhone = new Map(); // { [phone]: { socket, sessionId } }
 
 const normalizePhone = (val) => String(val || '').replace(/[^\d]/g, '').trim();
 
+// The database address, with the server's secret added so the Firebase rules can stay locked for everyone else
+const dbUrl = () =>
+  FIREBASE_DB_SECRET
+    ? `${FIREBASE_DB_URL}${FIREBASE_DB_URL.includes('?') ? '&' : '?'}auth=${encodeURIComponent(FIREBASE_DB_SECRET)}`
+    : FIREBASE_DB_URL;
+
+let storeLoaded = false; // nothing is saved until the old data has been loaded, so a cold start can never wipe it
 let saveTimer = null;
 const saveStore = () => {
+  if (!storeLoaded) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     try {
-      await fetch(FIREBASE_DB_URL, {
+      const r = await fetch(dbUrl(), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(store),
       });
+      if (!r.ok) console.error('Firebase save failed:', r.status);
     } catch (err) {
       console.error('Firebase save error:', err.message);
     }
@@ -52,23 +83,29 @@ const saveStore = () => {
 };
 
 const loadStore = async () => {
-  try {
-    const res = await fetch(FIREBASE_DB_URL);
-    if (!res.ok) return;
-    const data = await res.json();
-    if (data && typeof data === 'object') {
-      store.users = data.users || {};
-      store.contacts = data.contacts || {};
-      store.chats = data.chats || {};
-      store.messages = data.messages || {};
-      store.statuses = Array.isArray(data.statuses) ? data.statuses : [];
-      store.calls = Array.isArray(data.calls) ? data.calls : [];
-      // Reset online flags on cold boot
-      Object.values(store.users).forEach((u) => { u.online = false; });
-      console.log('Loaded store from Firebase.');
+  for (;;) {
+    try {
+      const res = await fetch(dbUrl());
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data === 'object') {
+          store.users = data.users || {};
+          store.contacts = data.contacts || {};
+          store.chats = data.chats || {};
+          store.messages = data.messages || {};
+          store.statuses = Array.isArray(data.statuses) ? data.statuses : [];
+          store.calls = Array.isArray(data.calls) ? data.calls : [];
+          Object.values(store.users).forEach((u) => { u.online = false; }); // reset online flags on cold boot
+        }
+        storeLoaded = true;
+        console.log('Loaded store from Firebase.');
+        return;
+      }
+      console.error('Firebase load failed:', res.status, '(check FIREBASE_DB_SECRET and the database rules)');
+    } catch (err) {
+      console.error('Firebase load error:', err.message);
     }
-  } catch (err) {
-    console.error('Firebase load error:', err.message);
+    await new Promise((r) => setTimeout(r, 5000));
   }
 };
 loadStore();
@@ -168,7 +205,7 @@ const createSessionResponse = (phone, name, email, platform) => {
   const userObj = {
     id: phone,
     phone,
-    email: email || existingUser.email || '',
+    email: existingUser.email || email || '',
     name: existingUser.name || name,
     about: existingUser.about || 'Hey there! I am using WhatsApp Live.',
     avatar: existingUser.avatar || null,
@@ -194,38 +231,67 @@ const createSessionResponse = (phone, name, email, platform) => {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'v15-email-otp-isolated-avatars',
+    version: 'v16-secure-login',
     emailConfigured: Boolean(process.env.BREVO_API_KEY || mailTransporter),
-    usersCount: Object.keys(store.users).length,
+    ready: storeLoaded,
   });
 });
 
 // ---------------- AUTH ROUTES ----------------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// While the server is waking up and loading data, ask the app to try again
+app.use((req, res, next) => {
+  if (storeLoaded || req.path === '/health' || req.path === '/rtc-call') return next();
+  return res.status(503).json({ error: 'The server is waking up. Please try again in a few seconds.' });
+});
+
 app.post('/auth/send-otp', async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
-  const name = String(req.body?.name || '').trim();
+  const name = String(req.body?.name || '').trim().slice(0, 60);
   const email = String(req.body?.email || '').trim().toLowerCase();
 
   if (!phone || phone.length < 4) return res.status(400).json({ error: 'Enter a valid phone number.' });
   if (!name) return res.status(400).json({ error: 'Enter your display name.' });
-  if (!email || !email.includes('@')) return res.status(400).json({ error: 'Enter a valid email address.' });
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
 
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore.set(phone, { otp, email, name, expiresAt: Date.now() + 5 * 60 * 1000 });
+  // A number belongs to the email it was first registered with
+  const existing = store.users[phone];
+  if (existing) {
+    if (existing.email && existing.email !== email) {
+      return res.status(403).json({ error: 'This number is already registered with a different email. Use the email you signed up with.' });
+    }
+    if (!existing.email && process.env.ALLOW_LEGACY_CLAIM !== '1') {
+      return res.status(403).json({ error: 'This number has no email saved yet. Ask the app owner for help.' });
+    }
+  }
+
+  // Limits so nobody can spam emails or use up your email quota
+  const pending = otpStore.get(phone);
+  if (pending && Date.now() - (pending.sentAt || 0) < 30000) {
+    return res.status(429).json({ error: 'Please wait 30 seconds before asking for another OTP.' });
+  }
+  if (!allowHit('ip:' + req.ip, 20, 3600000) || !allowHit('phone:' + phone, 5, 3600000) || !allowHit('email:' + email, 5, 3600000)) {
+    return res.status(429).json({ error: 'Too many OTP requests. Please try again in an hour.' });
+  }
+
+  const otp = String(crypto.randomInt(100000, 1000000));
+  otpStore.set(phone, { otp, email, name, expiresAt: Date.now() + 5 * 60 * 1000, attempts: 0, sentAt: Date.now() });
 
   try {
     await sendOtpEmail({ to: email, name, otp });
     res.json({ success: true, message: 'OTP sent to your email.' });
   } catch (err) {
+    otpStore.delete(phone);
     console.error('OTP email error:', err.message);
-    res.status(500).json({ error: 'Failed to send email: ' + err.message });
+    res.status(500).json({ error: 'Could not send the email. Please try again later.' });
   }
 });
 
 app.post('/auth/verify-otp', (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   const otp = String(req.body?.otp || '').trim();
-  const platform = String(req.body?.platform || 'web');
+  const platform = String(req.body?.platform || 'web').slice(0, 20);
 
   const record = otpStore.get(phone);
   if (!record) return res.status(400).json({ error: 'No OTP found. Please request a new one.' });
@@ -233,24 +299,50 @@ app.post('/auth/verify-otp', (req, res) => {
     otpStore.delete(phone);
     return res.status(400).json({ error: 'OTP expired. Please request a new one.' });
   }
-  if (record.otp !== otp) return res.status(400).json({ error: 'Incorrect OTP. Try again.' });
+  if (record.otp !== otp) {
+    record.attempts = (record.attempts || 0) + 1;
+    if (record.attempts >= 5) {
+      otpStore.delete(phone);
+      return res.status(400).json({ error: 'Too many wrong tries. Please request a new OTP.' });
+    }
+    return res.status(400).json({ error: 'Incorrect OTP. Try again.' });
+  }
 
   otpStore.delete(phone);
   res.json(createSessionResponse(phone, record.name, record.email, platform));
 });
 
-// Legacy direct-login kept as fallback
-app.post('/auth/direct-login', (req, res) => {
-  const phone = normalizePhone(req.body?.phone);
-  const name = String(req.body?.name || '').trim();
-  const platform = String(req.body?.platform || 'web');
-  if (!phone || !name) return res.status(400).json({ error: 'Phone and name are required.' });
-  res.json(createSessionResponse(phone, name, '', platform));
-});
+// Every request below this line needs a valid login token. The user is taken from the token,
+// never from what the app sends, so nobody can read or change another person's data.
+const requireAuth = (req, res, next) => {
+  if (req.path === '/rtc-call') return next(); // the call page loads inside a frame and cannot send the token
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const phone = normalizePhone(decoded.phone);
+    const user = store.users[phone];
+    if (!user || user.activeSessionId !== decoded.sessionId) {
+      return res.status(401).json({ error: 'Session ended. Please log in again.' });
+    }
+    req.userPhone = phone;
+  } catch (_e) {
+    return res.status(401).json({ error: 'Please log in again.' });
+  }
+  Object.defineProperty(req, 'query', { value: { ...req.query, ...(req.query.userId !== undefined ? { userId: req.userPhone } : {}) }, writable: true, configurable: true });
+  if (req.body && typeof req.body === 'object') {
+    ['userId', 'myPhone', 'creatorPhone', 'requesterPhone', 'phone'].forEach((k) => {
+      if (k in req.body) req.body[k] = req.userPhone;
+    });
+  }
+  next();
+};
+app.use(requireAuth);
 
 // ---------------- PROFILE ----------------
 app.put('/users/:phone/profile', (req, res) => {
   const phone = normalizePhone(req.params.phone);
+  if (phone !== req.userPhone) return res.status(403).json({ error: 'You can only edit your own profile.' });
   if (!store.users[phone]) return res.status(404).json({ error: 'User not found.' });
 
   const name = String(req.body?.name || '').trim();
