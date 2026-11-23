@@ -6,6 +6,7 @@ const nodemailer = require('nodemailer');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3001;
+const CURRENT_TERMS_VERSION = '2026-11-24-v1';
 const JWT_SECRET = process.env.JWT_SECRET || 'local-testing-secret';
 if (!process.env.JWT_SECRET && (process.env.RENDER || process.env.NODE_ENV === 'production')) {
   console.error('STOP: set a long random JWT_SECRET environment variable on Render (at least 32 random characters).');
@@ -44,7 +45,7 @@ const io = new Server(server, {
 
 // ---------------- IN-MEMORY + FIREBASE STORE ----------------
 let store = {
-  users: {},    // { [phone]: { id, phone, email, name, about, avatar, online, lastSeen, platform } }
+  users: {},    // { [phone]: { id, phone, email, name, about, avatar, online, lastSeen, platform, termsAcceptedVersion, termsAcceptedAt, termsAcceptedIp } }
   contacts: {}, // { [ownerPhone]: { [contactPhone]: { phone, name, addedAt } } }
   chats: {},    // { [chatId]: { id, isGroup, title, description, avatar, creatorPhone, members: [], lastMessage, updatedAt } }
   messages: {}, // { [chatId]: [ { id, chatId, senderId, senderName, type, body, createdAt } ] }
@@ -57,13 +58,12 @@ const activeSocketByPhone = new Map(); // { [phone]: { socket, sessionId } }
 
 const normalizePhone = (val) => String(val || '').replace(/[^\d]/g, '').trim();
 
-// The database address, with the server's secret added so the Firebase rules can stay locked for everyone else
 const dbUrl = () =>
   FIREBASE_DB_SECRET
     ? `${FIREBASE_DB_URL}${FIREBASE_DB_URL.includes('?') ? '&' : '?'}auth=${encodeURIComponent(FIREBASE_DB_SECRET)}`
     : FIREBASE_DB_URL;
 
-let storeLoaded = false; // nothing is saved until the old data has been loaded, so a cold start can never wipe it
+let storeLoaded = false;
 let saveTimer = null;
 const saveStore = () => {
   if (!storeLoaded) return;
@@ -95,7 +95,7 @@ const loadStore = async () => {
           store.messages = data.messages || {};
           store.statuses = Array.isArray(data.statuses) ? data.statuses : [];
           store.calls = Array.isArray(data.calls) ? data.calls : [];
-          Object.values(store.users).forEach((u) => { u.online = false; }); // reset online flags on cold boot
+          Object.values(store.users).forEach((u) => { u.online = false; });
         }
         storeLoaded = true;
         console.log('Loaded store from Firebase.');
@@ -120,10 +120,9 @@ const mailTransporter =
     : null;
 
 async function sendOtpEmail({ to, name, otp }) {
-  const subject = 'Your Kutumbham Live Login OTP';
-  const textContent = `Hello ${name},\n\nYour 6-digit login OTP is: ${otp}\n\nThis code expires in 5 minutes.`;
+  const subject = 'Your Kutumbham India Login OTP';
+  const textContent = `Hello ${name},\n\nYour 6-digit login OTP is: ${otp}\n\nThis code expires in 5 minutes. Never share this OTP with anyone.`;
 
-  // Option A (Recommended on Render Free Tier): Brevo HTTP API over HTTPS
   if (process.env.BREVO_API_KEY) {
     const senderEmail = process.env.SMTP_USER || process.env.BREVO_SENDER_EMAIL;
     if (!senderEmail) {
@@ -137,7 +136,7 @@ async function sendOtpEmail({ to, name, otp }) {
         accept: 'application/json',
       },
       body: JSON.stringify({
-        sender: { name: 'Kutumbham Live', email: senderEmail },
+        sender: { name: 'Kutumbham India', email: senderEmail },
         to: [{ email: to, name }],
         subject,
         textContent,
@@ -150,10 +149,9 @@ async function sendOtpEmail({ to, name, otp }) {
     return;
   }
 
-  // Option B (Localhost or Paid Render): Gmail SMTP via Nodemailer
   if (mailTransporter) {
     await mailTransporter.sendMail({
-      from: `"Kutumbham Live" <${process.env.SMTP_USER}>`,
+      from: `"Kutumbham India" <${process.env.SMTP_USER}>`,
       to,
       subject,
       text: textContent,
@@ -184,7 +182,7 @@ const formatChatForUser = (chat, viewerPhone) => {
     title: savedContact?.name || otherUser.name || otherPhone,
     avatar: otherUser.avatar || null,
     otherPhone,
-    otherAbout: otherUser.about || 'Hey there! I am using WhatsApp Live.',
+    otherAbout: otherUser.about || 'Hey there! I am using Kutumbham India.',
     otherOnline: Boolean(otherUser.online),
     otherLastSeen: otherUser.lastSeen || null,
     isContact: Boolean(savedContact),
@@ -207,12 +205,16 @@ const createSessionResponse = (phone, name, email, platform) => {
     phone,
     email: existingUser.email || email || '',
     name: existingUser.name || name,
-    about: existingUser.about || 'Hey there! I am using WhatsApp Live.',
+    about: existingUser.about || 'Hey there! I am using Kutumbham India.',
     avatar: existingUser.avatar || null,
     platform,
     online: true,
     activeSessionId: sessionId,
     lastSeen: new Date().toISOString(),
+    termsAcceptedVersion: existingUser.termsAcceptedVersion || null,
+    termsAcceptedAt: existingUser.termsAcceptedAt || null,
+    termsAcceptedIp: existingUser.termsAcceptedIp || null,
+    termsUserAgent: existingUser.termsUserAgent || null,
   };
 
   store.users[phone] = userObj;
@@ -231,7 +233,8 @@ const createSessionResponse = (phone, name, email, platform) => {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'v16-secure-login',
+    version: 'v17-terms-compliance',
+    termsVersion: CURRENT_TERMS_VERSION,
     emailConfigured: Boolean(process.env.BREVO_API_KEY || mailTransporter),
     ready: storeLoaded,
   });
@@ -240,7 +243,6 @@ app.get('/health', (_req, res) => {
 // ---------------- AUTH ROUTES ----------------
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// While the server is waking up and loading data, ask the app to try again
 app.use((req, res, next) => {
   if (storeLoaded || req.path === '/health' || req.path === '/rtc-call') return next();
   return res.status(503).json({ error: 'The server is waking up. Please try again in a few seconds.' });
@@ -255,7 +257,6 @@ app.post('/auth/send-otp', async (req, res) => {
   if (!name) return res.status(400).json({ error: 'Enter your display name.' });
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
 
-  // A number belongs to the email it was first registered with
   const existing = store.users[phone];
   if (existing) {
     if (existing.email && existing.email !== email) {
@@ -266,7 +267,6 @@ app.post('/auth/send-otp', async (req, res) => {
     }
   }
 
-  // Limits so nobody can spam emails or use up your email quota
   const pending = otpStore.get(phone);
   if (pending && Date.now() - (pending.sentAt || 0) < 30000) {
     return res.status(429).json({ error: 'Please wait 30 seconds before asking for another OTP.' });
@@ -312,10 +312,9 @@ app.post('/auth/verify-otp', (req, res) => {
   res.json(createSessionResponse(phone, record.name, record.email, platform));
 });
 
-// Every request below this line needs a valid login token. The user is taken from the token,
-// never from what the app sends, so nobody can read or change another person's data.
+// ---------------- AUTH MIDDLEWARE ----------------
 const requireAuth = (req, res, next) => {
-  if (req.path === '/rtc-call') return next(); // the call page loads inside a frame and cannot send the token
+  if (req.path === '/rtc-call') return next();
   const header = req.get('authorization') || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   try {
@@ -329,7 +328,11 @@ const requireAuth = (req, res, next) => {
   } catch (_e) {
     return res.status(401).json({ error: 'Please log in again.' });
   }
-  Object.defineProperty(req, 'query', { value: { ...req.query, ...(req.query.userId !== undefined ? { userId: req.userPhone } : {}) }, writable: true, configurable: true });
+  Object.defineProperty(req, 'query', {
+    value: { ...req.query, ...(req.query.userId !== undefined ? { userId: req.userPhone } : {}) },
+    writable: true,
+    configurable: true,
+  });
   if (req.body && typeof req.body === 'object') {
     ['userId', 'myPhone', 'creatorPhone', 'requesterPhone', 'phone'].forEach((k) => {
       if (k in req.body) req.body[k] = req.userPhone;
@@ -338,6 +341,24 @@ const requireAuth = (req, res, next) => {
   next();
 };
 app.use(requireAuth);
+
+// ---------------- LEGAL TERMS ACCEPTANCE (AUDIT LOGGED IN FIREBASE) ----------------
+app.post('/users/accept-terms', (req, res) => {
+  const phone = req.userPhone;
+  const user = store.users[phone];
+  if (!user) return res.status(404).json({ error: 'User not found.' });
+
+  const version = String(req.body?.version || CURRENT_TERMS_VERSION).trim().slice(0, 40);
+  store.users[phone] = {
+    ...user,
+    termsAcceptedVersion: version,
+    termsAcceptedAt: new Date().toISOString(),
+    termsAcceptedIp: String(req.ip || '').slice(0, 64),
+    termsUserAgent: String(req.get('user-agent') || '').slice(0, 200),
+  };
+  saveStore();
+  res.json({ success: true, user: store.users[phone] });
+});
 
 // ---------------- PROFILE ----------------
 app.put('/users/:phone/profile', (req, res) => {
@@ -354,12 +375,11 @@ app.put('/users/:phone/profile', (req, res) => {
   store.users[phone] = {
     ...store.users[phone],
     name,
-    about: about || 'Hey there! I am using WhatsApp Live.',
+    about: about || 'Hey there! I am using Kutumbham India.',
     avatar,
   };
   saveStore();
 
-  // Notify anyone who shares a chat or has this user in contacts
   const notifyPhones = new Set([phone]);
   Object.values(store.chats).forEach((chat) => {
     if ((chat.members || []).includes(phone)) {
@@ -385,7 +405,7 @@ app.get('/contacts', (req, res) => {
       phone: c.phone,
       name: c.name,
       avatar: u.avatar || null,
-      about: u.about || 'Hey there! I am using WhatsApp Live.',
+      about: u.about || 'Hey there! I am using Kutumbham India.',
       online: Boolean(u.online),
       lastSeen: u.lastSeen || null,
     };
@@ -552,7 +572,6 @@ app.post('/statuses', (req, res) => {
   store.statuses.push(statusObj);
   saveStore();
 
-  // Notify self + everyone who has this user in their contacts
   const notifyPhones = new Set([phone]);
   Object.entries(store.contacts).forEach(([owner, list]) => {
     if (list && list[phone]) notifyPhones.add(owner);
@@ -647,7 +666,6 @@ app.get('/rtc-call', (req, res) => {
 
 // ---------------- SOCKET.IO ----------------
 io.on('connection', (socket) => {
-  // WebRTC signaling (iframe connects without JWT)
   socket.on('rtc:join', ({ room }) => {
     socket.join(`rtc:${room}`);
     socket.to(`rtc:${room}`).emit('rtc:peer-joined');
@@ -656,7 +674,6 @@ io.on('connection', (socket) => {
   socket.on('rtc:answer', ({ room, answer }) => socket.to(`rtc:${room}`).emit('rtc:answer', { answer }));
   socket.on('rtc:ice', ({ room, candidate }) => socket.to(`rtc:${room}`).emit('rtc:ice', { candidate }));
 
-  // Authenticated chat socket
   const token = socket.handshake.auth?.token;
   if (!token) return;
 
@@ -763,5 +780,5 @@ io.on('connection', (socket) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`WhatsApp Live backend v15 running on port ${PORT}`);
+  console.log(`Kutumbham India backend v17-terms-compliance running on port ${PORT}`);
 });
